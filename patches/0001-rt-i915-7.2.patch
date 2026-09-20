@@ -1,0 +1,436 @@
+From: Sergi Perich <info@soploslinux.com>
+Date: 2026-09-20
+Subject: [PATCH] drm/i915: make the driver usable on PREEMPT_RT
+
+Mainline marks DRM_I915 as "depends on !PREEMPT_RT". Every PREEMPT_RT
+kernel therefore silently loses the driver at "make olddefconfig", and a
+machine with an Intel iGPU boots to a black screen and a blinking cursor
+because no KMS driver exists for it.
+
+The reason for the dependency is that i915 takes spinlock_t locks with hard
+interrupts disabled, which is fine on a regular kernel and a sleeping-in-
+atomic bug on PREEMPT_RT, where spinlock_t is a sleeping lock.
+
+This patch removes the dependency and fixes the places where that happens:
+
+  - Vblank evasion (intel_pipe_update_start/end, the legacy cursor update,
+    the scanout position query and the evade loop) runs with interrupts
+    disabled and calls into intel_vblank_section_enter(), which takes
+    uncore->lock (needed on IVB and HSW to serialise register accesses).
+    On RT the section now keeps interrupts enabled. Evasion becomes best
+    effort: an atomic update preempted past its vblank shows up as an
+    "Atomic update failure" for that one frame instead of sleeping in
+    atomic context. Xe shares these files and is left unchanged.
+
+  - The display tracepoints sample the scanline in TP_fast_assign, which
+    takes uncore->lock. Tracepoint probes run with preemption disabled, so
+    on RT the scanline is reported as 0.
+
+  - execlists_dequeue_irq() disabled interrupts around a section that takes
+    sched_engine->lock. On RT the lock serialises the submission and the
+    tasklet is never reentered, so the interrupt disabling is skipped.
+
+Everything else that disables interrupts in i915 only touches seqcounts or
+lockdep state and needs no change. A non-RT kernel builds to the same code
+as before.
+
+Not handled: GEM_BUG_ON(!irqs_disabled()) in i915_request.c and the
+in_atomic()/irqs_disabled() checks in intel_engine_cs.c and intel_guc.h.
+The asserts are only built with DRM_I915_DEBUG_GEM. The other two are worth
+revisiting for GuC platforms.
+
+Soplos Linux patch -- not for upstream submission.
+Applies to Linux 7.2.x. Compile-tested on 7.2.6 with PREEMPT_RT and
+without, for both i915 and xe. Not boot-tested yet.
+---
+--- a/drivers/gpu/drm/i915/Kconfig
++++ b/drivers/gpu/drm/i915/Kconfig
+@@ -3,7 +3,6 @@
+ 	tristate "Intel 8xx/9xx/G3x/G4x/HD Graphics"
+ 	depends on DRM
+ 	depends on X86 && PCI
+-	depends on !PREEMPT_RT
+ 	select INTEL_GTT if X86
+ 	select INTERVAL_TREE
+ 	# we need shmfs for the swappable backing store, and in particular
+--- a/drivers/gpu/drm/i915/display/intel_vblank.h
++++ b/drivers/gpu/drm/i915/display/intel_vblank.h
+@@ -6,6 +6,7 @@
+ #ifndef __INTEL_VBLANK_H__
+ #define __INTEL_VBLANK_H__
+ 
++#include <linux/irqflags.h>
+ #include <linux/ktime.h>
+ #include <linux/types.h>
+ 
+@@ -15,6 +16,34 @@
+ struct intel_crtc;
+ struct intel_crtc_state;
+ 
++/*
++ * On PREEMPT_RT spinlock_t is a sleeping lock, and the i915 display update
++ * path takes such locks (uncore->lock in the vblank section, plus others)
++ * inside the vblank evasion section, which otherwise runs with hard
++ * interrupts disabled. Sleeping with interrupts disabled is a bug, so on RT
++ * the section keeps interrupts enabled instead: evasion becomes best effort.
++ * An atomic update preempted past its vblank shows up as an "Atomic update
++ * failure" for that one frame, but can no longer sleep in atomic context.
++ * Xe does not take those locks in the section and keeps the strict behaviour.
++ *
++ * For the same reason the scanline is not sampled from inside tracepoints on
++ * RT: sampling it takes uncore->lock, and tracepoint probes run with
++ * preemption disabled.
++ */
++#if defined(I915) && defined(CONFIG_PREEMPT_RT)
++static inline void intel_vblank_irq_disable(void) {}
++static inline void intel_vblank_irq_enable(void) {}
++#define intel_vblank_irq_save(flags)		((flags) = 0)
++#define intel_vblank_irq_restore(flags)		((void)(flags))
++#define intel_trace_scanline(crtc)		0
++#else
++static inline void intel_vblank_irq_disable(void) { local_irq_disable(); }
++static inline void intel_vblank_irq_enable(void) { local_irq_enable(); }
++#define intel_vblank_irq_save(flags)		local_irq_save(flags)
++#define intel_vblank_irq_restore(flags)		local_irq_restore(flags)
++#define intel_trace_scanline(crtc)		intel_get_crtc_scanline(crtc)
++#endif
++
+ struct intel_vblank_evade_ctx {
+ 	struct intel_crtc *crtc;
+ 	int min, max, vblank_start;
+--- a/drivers/gpu/drm/i915/display/intel_vblank.c
++++ b/drivers/gpu/drm/i915/display/intel_vblank.c
+@@ -360,7 +360,7 @@
+ 	 * timing critical raw register reads, potentially with
+ 	 * preemption disabled, so the following code must not block.
+ 	 */
+-	local_irq_save(irqflags);
++	intel_vblank_irq_save(irqflags);
+ 	intel_vblank_section_enter(display);
+ 
+ 	/* preempt_disable_rt() should go right here in PREEMPT_RT patchset. */
+@@ -430,7 +430,7 @@
+ 	/* preempt_enable_rt() should go right here in PREEMPT_RT patchset. */
+ 
+ 	intel_vblank_section_exit(display);
+-	local_irq_restore(irqflags);
++	intel_vblank_irq_restore(irqflags);
+ 
+ 	/*
+ 	 * While in vblank, position will be negative
+@@ -468,13 +468,13 @@
+ 	unsigned long irqflags;
+ 	int position;
+ 
+-	local_irq_save(irqflags);
++	intel_vblank_irq_save(irqflags);
+ 	intel_vblank_section_enter(display);
+ 
+ 	position = __intel_get_crtc_scanline(crtc);
+ 
+ 	intel_vblank_section_exit(display);
+-	local_irq_restore(irqflags);
++	intel_vblank_irq_restore(irqflags);
+ 
+ 	return position;
+ }
+@@ -764,11 +764,11 @@
+ 			break;
+ 		}
+ 
+-		local_irq_enable();
++		intel_vblank_irq_enable();
+ 
+ 		timeout = schedule_timeout(timeout);
+ 
+-		local_irq_disable();
++		intel_vblank_irq_disable();
+ 	}
+ 
+ 	finish_wait(wq, &wait);
+--- a/drivers/gpu/drm/i915/display/intel_crtc.c
++++ b/drivers/gpu/drm/i915/display/intel_crtc.c
+@@ -633,7 +633,7 @@
+ 	 */
+ 	intel_psr_wait_for_idle_locked(new_crtc_state);
+ 
+-	local_irq_disable();
++	intel_vblank_irq_disable();
+ 
+ 	crtc->debug.min_vbl = evade.min;
+ 	crtc->debug.max_vbl = evade.max;
+@@ -651,7 +651,7 @@
+ 	return;
+ 
+ irq_disable:
+-	local_irq_disable();
++	intel_vblank_irq_disable();
+ }
+ 
+ #if IS_ENABLED(CONFIG_DRM_I915_DEBUG_VBLANK_EVADE)
+@@ -798,7 +798,7 @@
+ 	     !new_crtc_state->vrr.enable))
+ 		intel_vrr_send_push(NULL, new_crtc_state);
+ 
+-	local_irq_enable();
++	intel_vblank_irq_enable();
+ 
+ 	if (intel_parent_vgpu_active(display))
+ 		goto out;
+--- a/drivers/gpu/drm/i915/display/intel_cursor.c
++++ b/drivers/gpu/drm/i915/display/intel_cursor.c
+@@ -924,13 +924,13 @@
+ 		 */
+ 		intel_psr_wait_for_idle_locked(crtc_state);
+ 
+-		local_irq_disable();
++		intel_vblank_irq_disable();
+ 
+ 		intel_vblank_evade(&evade);
+ 
+ 		drm_crtc_vblank_put(&crtc->base);
+ 	} else {
+-		local_irq_disable();
++		intel_vblank_irq_disable();
+ 	}
+ 
+ 	if (new_plane_state->uapi.visible) {
+@@ -940,7 +940,7 @@
+ 		intel_plane_disable_arm(NULL, plane, crtc_state);
+ 	}
+ 
+-	local_irq_enable();
++	intel_vblank_irq_enable();
+ 
+ 	intel_psr_unlock(crtc_state);
+ 
+--- a/drivers/gpu/drm/i915/display/intel_display_trace.h
++++ b/drivers/gpu/drm/i915/display/intel_display_trace.h
+@@ -86,7 +86,7 @@
+ 				  sizeof(__entry->scanline[0]) * I915_MAX_PIPES);
+ 			   for_each_intel_crtc(display, it__) {
+ 				   __entry->frame[it__->pipe] = intel_crtc_get_vblank_counter(it__);
+-				   __entry->scanline[it__->pipe] = intel_get_crtc_scanline(it__);
++				   __entry->scanline[it__->pipe] = intel_trace_scanline(it__);
+ 			   }
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   ),
+@@ -116,7 +116,7 @@
+ 				  sizeof(__entry->scanline[0]) * I915_MAX_PIPES);
+ 			   for_each_intel_crtc(display, it__) {
+ 				   __entry->frame[it__->pipe] = intel_crtc_get_vblank_counter(it__);
+-				   __entry->scanline[it__->pipe] = intel_get_crtc_scanline(it__);
++				   __entry->scanline[it__->pipe] = intel_trace_scanline(it__);
+ 			   }
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   ),
+@@ -140,7 +140,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pipe %c, frame=%u, scanline=%u",
+@@ -164,7 +164,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   memcpy(__entry->crcs, crcs, sizeof(__entry->crcs));
+ 			   ),
+ 
+@@ -192,7 +192,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pipe %c, frame=%u, scanline=%u",
+@@ -217,7 +217,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pch transcoder %c, frame=%u, scanline=%u",
+@@ -246,7 +246,7 @@
+ 				  sizeof(__entry->scanline[0]) * I915_MAX_PIPES);
+ 			   for_each_intel_crtc(display, crtc) {
+ 				   __entry->frame[crtc->pipe] = intel_crtc_get_vblank_counter(crtc);
+-				   __entry->scanline[crtc->pipe] = intel_get_crtc_scanline(crtc);
++				   __entry->scanline[crtc->pipe] = intel_trace_scanline(crtc);
+ 			   }
+ 			   __entry->old = old;
+ 			   __entry->new = new;
+@@ -284,7 +284,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   __entry->primary = wm->pipe[crtc->pipe].plane[PLANE_PRIMARY];
+ 			   __entry->sprite = wm->pipe[crtc->pipe].plane[PLANE_SPRITE0];
+ 			   __entry->cursor = wm->pipe[crtc->pipe].plane[PLANE_CURSOR];
+@@ -331,7 +331,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   __entry->level = wm->level;
+ 			   __entry->cxsr = wm->cxsr;
+ 			   __entry->primary = wm->pipe[crtc->pipe].plane[PLANE_PRIMARY];
+@@ -368,7 +368,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   __entry->sprite0_start = sprite0_start;
+ 			   __entry->sprite1_start = sprite1_start;
+ 			   __entry->fifo_size = fifo_size;
+@@ -398,7 +398,7 @@
+ 			   __assign_str(name);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   __entry->async_flip = async_flip;
+ 			   ),
+ 
+@@ -427,7 +427,7 @@
+ 			   __assign_str(name);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   __entry->format = plane_state->hw.fb->format->format;
+ 			   memcpy(__entry->src, &plane_state->uapi.src, sizeof(__entry->src));
+ 			   memcpy(__entry->dst, &plane_state->uapi.dst, sizeof(__entry->dst));
+@@ -460,7 +460,7 @@
+ 			   __assign_str(name);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   __entry->format = plane_state->hw.fb->format->format;
+ 			   memcpy(__entry->src, &plane_state->uapi.src, sizeof(__entry->src));
+ 			   memcpy(__entry->dst, &plane_state->uapi.dst, sizeof(__entry->dst));
+@@ -490,7 +490,7 @@
+ 			   __assign_str(name);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pipe %c, %s, frame=%u, scanline=%u",
+@@ -524,7 +524,7 @@
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->scaler_id = scaler_id;
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   __entry->x = x;
+ 			   __entry->y = y;
+ 			   __entry->w = w;
+@@ -559,7 +559,7 @@
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->scaler_id = scaler_id;
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   __entry->x = x;
+ 			   __entry->y = y;
+ 			   __entry->w = w;
+@@ -589,7 +589,7 @@
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->scaler_id = scaler_id;
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pipe %c, scaler %d, frame=%u, scanline=%u",
+@@ -617,7 +617,7 @@
+ 			   __assign_str(name);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pipe %c, %s, frame=%u, scanline=%u",
+@@ -645,7 +645,7 @@
+ 			   __assign_str(name);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pipe %c, %s, frame=%u, scanline=%u",
+@@ -673,7 +673,7 @@
+ 			   __assign_str(name);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pipe %c, %s, frame=%u, scanline=%u",
+@@ -696,7 +696,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pipe %c, frame=%u, scanline=%u",
+@@ -719,7 +719,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   ),
+ 
+ 	    TP_printk("dev %s, pipe %c, frame=%u, scanline=%u",
+@@ -744,7 +744,7 @@
+ 			   __assign_str(dev);
+ 			   __entry->pipe_name = pipe_name(crtc->pipe);
+ 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
+-			   __entry->scanline = intel_get_crtc_scanline(crtc);
++			   __entry->scanline = intel_trace_scanline(crtc);
+ 			   __entry->min = crtc->debug.min_vbl;
+ 			   __entry->max = crtc->debug.max_vbl;
+ 			   ),
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -1616,9 +1616,16 @@
+ 
+ static void execlists_dequeue_irq(struct intel_engine_cs *engine)
+ {
+-	local_irq_disable(); /* Suspend interrupts across request submission */
++	/*
++	 * On PREEMPT_RT sched_engine->lock is a sleeping lock, which must not
++	 * be taken with interrupts disabled. The lock itself serialises the
++	 * submission there, and the tasklet running us is never reentered.
++	 */
++	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
++		local_irq_disable(); /* Suspend interrupts across request submission */
+ 	execlists_dequeue(engine);
+-	local_irq_enable(); /* flush irq_work (e.g. breadcrumb enabling) */
++	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
++		local_irq_enable(); /* flush irq_work (e.g. breadcrumb enabling) */
+ }
+ 
+ static void clear_ports(struct i915_request **ports, int count)
