@@ -1,5 +1,17 @@
 # Changelog — rt-i915-soplos
 
+## 1.1.0 — 2026-10-19
+
+### Added
+
+- `0001-rt-i915-7.3.patch` — port of the 7.2 patch to Linux 7.3.
+  The logic is identical; only two hunk offsets in `intel_cursor.c`
+  changed by -2 lines due to unrelated upstream additions above the
+  patched sections. Validated clean with `patch -p1 --dry-run` against
+  linux-7.3 (zero fuzz, zero rejected hunks).
+
+---
+
 ## 1.0.0 — 2026-09-20
 
 Initial release.
