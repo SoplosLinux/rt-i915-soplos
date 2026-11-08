@@ -1,5 +1,17 @@
 # Changelog — rt-i915-soplos
 
+## 1.2.0 — 2026-11-08
+
+### Added
+
+- `0001-rt-i915-6.18.patch` — port of the 7.2 patch to the Linux 6.18
+  long-term line (6.18.62). The 7.2 patch applies to 6.18.62 only with fuzz 2:
+  without it 3 hunks fail and the offsets reach 72 lines. All the hunks are
+  kept and three were re-anchored (`local_irq_enable()` in
+  `intel_pipe_update_end()` and two scanline samples of the tracepoints),
+  because their context differs; the change they make is the same. Applies to
+  6.18.62 with `patch -p1 --fuzz=0`. Not yet compiled or boot-tested.
+
 ## 1.1.0 — 2026-10-19
 
 ### Added

@@ -55,6 +55,7 @@ before.
 | File | Kernel versions | Base |
 |------|-----------------|------|
 | `patches/0001-rt-i915-7.2.patch` | Linux 7.2.x | written against 7.2.6 |
+| `patches/0001-rt-i915-6.18.patch` | Linux 6.18 LTS (6.18.62) | port of the 7.2 patch |
 
 One file per `major.minor` line, as with the other Soplos patch repos.
 
@@ -62,6 +63,16 @@ One file per `major.minor` line, as with the other Soplos patch repos.
 
 ## Status
 
+- **6.18 LTS (6.18.62):** the 7.2 patch applies to 6.18.62 only with fuzz 2
+  (3 hunks fail without it, and the offsets reach 72 lines), so it was ported:
+  every hunk is kept and three were re-anchored (the `local_irq_enable()` of
+  `intel_pipe_update_end()` and two scanline samples of the tracepoints),
+  because their context differs. 6.18 has the same set of places that disable
+  interrupts as 7.2 (`intel_vblank.c`, `intel_crtc.c`, `intel_cursor.c` and
+  `intel_execlists_submission.c`), and the `-DI915` that tells i915 from Xe.
+  Verified with `patch -p1 --fuzz=0` against the kernel.org `v6.18.62`
+  tarball: no offset, no fuzz, no rejects. **Not yet compiled or
+  boot-tested.**
 - **7.2.6:** the patch applies clean to the 7 touched files, and compiles
   without errors or warnings with PREEMPT_RT and without it, for both i915
   and xe. With PREEMPT_RT, `DRM_I915=m` survives `olddefconfig`. Without RT
